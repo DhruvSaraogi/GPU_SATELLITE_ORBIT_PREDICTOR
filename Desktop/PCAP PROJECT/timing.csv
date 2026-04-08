@@ -1,0 +1,4 @@
+method,time_ms
+CPU Euler,328.64
+GPU Euler,64.34
+GPU RK4,180.37
