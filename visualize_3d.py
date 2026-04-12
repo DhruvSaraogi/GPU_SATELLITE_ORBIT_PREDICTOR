@@ -17,6 +17,9 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 R_EARTH = 6.371e6  # m
+VISUAL_EARTH_SCALE = 10.0  # Display-only scale to make Earth easier to see.
+FORCE_COMMON_LAUNCH = True  # Visualization-only: all tracks start from one launch point.
+COMMON_LAUNCH_RADIUS_M = R_EARTH
 
 CLASS_COLORS = {
     1: "#2ecc71",  # stable
@@ -80,28 +83,63 @@ def to_3d_track(x_m: np.ndarray, y_m: np.ndarray, sat_id: int) -> np.ndarray:
     rx = rotation_matrix_x(math.radians(inclination_deg))
     rz = rotation_matrix_z(math.radians(raan_deg))
     rot = rz @ rx
-    return rot @ track
+    rotated = rot @ track
+
+    if FORCE_COMMON_LAUNCH:
+        anchor = np.array([[COMMON_LAUNCH_RADIUS_M], [0.0], [0.0]], dtype=float)
+        rotated = anchor + (rotated - rotated[:, [0]])
+
+    return rotated
 
 
-def load_trajectories(path: str) -> Tuple[Dict[int, pd.DataFrame], Dict[int, np.ndarray], int]:
+def load_trajectories(
+    path: str,
+) -> Tuple[
+    Dict[int, pd.DataFrame],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    Dict[int, Dict[str, float]],
+    int,
+]:
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("trajectory_samples.csv is empty")
 
+    if "mass_kg" not in df.columns:
+        df["mass_kg"] = 500.0
+
+    if "speed_ms" not in df.columns:
+        if "vx_ms" in df.columns and "vy_ms" in df.columns:
+            df["speed_ms"] = np.sqrt(df["vx_ms"] ** 2 + df["vy_ms"] ** 2)
+        else:
+            df["speed_ms"] = np.nan
+
     grouped = {}
     transformed = {}
+    step_arrays = {}
+    speed_arrays = {}
+    sat_meta = {}
     max_step = 0
 
     for sat_id, sub in df.groupby("sat_id"):
         sub = sub.sort_values("step").reset_index(drop=True)
         grouped[sat_id] = sub
+        step_arrays[sat_id] = sub["step"].to_numpy()
+        speed_arrays[sat_id] = sub["speed_ms"].to_numpy()
+
+        sat_meta[sat_id] = {
+            "class": float(sub["class"].iloc[0]),
+            "mass_kg": float(sub["mass_kg"].iloc[0]),
+            "v0_ms": float(sub["speed_ms"].iloc[0]) if not np.isnan(sub["speed_ms"].iloc[0]) else 0.0,
+        }
 
         xyz = to_3d_track(sub["x_m"].to_numpy(), sub["y_m"].to_numpy(), int(sat_id))
         transformed[sat_id] = xyz
 
         max_step = max(max_step, int(sub["step"].max()))
 
-    return grouped, transformed, max_step
+    return grouped, transformed, step_arrays, speed_arrays, sat_meta, max_step
 
 
 def main() -> Optional[FuncAnimation]:
@@ -112,8 +150,25 @@ def main() -> Optional[FuncAnimation]:
         print("trajectory_samples.csv not found. Run satellite_sim first.")
         return None
 
-    tracks, transformed, max_step = load_trajectories(csv_path)
+    tracks, transformed, step_arrays, speed_arrays, sat_meta, max_step = load_trajectories(csv_path)
     sat_ids = sorted(tracks.keys())
+
+    # Performance profile: "fast" is tuned for 6000-satellite desktop playback.
+    render_profile = os.environ.get("VIS3D_PROFILE", "fast").strip().lower()
+    fast_mode = render_profile != "quality"
+
+    # Precompute display coordinates once; apply same visual scale used for Earth.
+    transformed_km = {
+        sat_id: (transformed[sat_id] / 1000.0) * VISUAL_EARTH_SCALE
+        for sat_id in sat_ids
+    }
+    step_stride_map = {}
+    for sat_id in sat_ids:
+        steps = step_arrays[sat_id]
+        if len(steps) >= 2:
+            step_stride_map[sat_id] = max(1, int(steps[1] - steps[0]))
+        else:
+            step_stride_map[sat_id] = 1
 
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
@@ -121,13 +176,14 @@ def main() -> Optional[FuncAnimation]:
     # Draw Earth sphere.
     u = np.linspace(0, 2 * np.pi, 72)
     v = np.linspace(0, np.pi, 36)
-    x = (R_EARTH * np.outer(np.cos(u), np.sin(v))) / 1000.0
-    y = (R_EARTH * np.outer(np.sin(u), np.sin(v))) / 1000.0
-    z = (R_EARTH * np.outer(np.ones_like(u), np.cos(v))) / 1000.0
+    earth_radius_km = (R_EARTH / 1000.0) * VISUAL_EARTH_SCALE
+    x = earth_radius_km * np.outer(np.cos(u), np.sin(v))
+    y = earth_radius_km * np.outer(np.sin(u), np.sin(v))
+    z = earth_radius_km * np.outer(np.ones_like(u), np.cos(v))
     ax.plot_surface(x, y, z, rstride=1, cstride=1, color="#95c8d8", alpha=0.45, linewidth=0)
 
     # Rotating meridian line to show Earth rotation.
-    meridian_radius = R_EARTH / 1000.0
+    meridian_radius = earth_radius_km
     meridian_theta = np.linspace(-np.pi / 2, np.pi / 2, 200)
     meridian_base = np.vstack([
         np.zeros_like(meridian_theta),
@@ -137,32 +193,31 @@ def main() -> Optional[FuncAnimation]:
     (meridian_line,) = ax.plot([], [], [], color="black", linewidth=1.5, alpha=0.8)
 
     # Launch site marker at equator (rotates with Earth).
-    launch_site_base = np.array([[meridian_radius], [0.0], [0.0]])
+    launch_site_radius = (COMMON_LAUNCH_RADIUS_M / 1000.0) * VISUAL_EARTH_SCALE
+    launch_site_base = np.array([[launch_site_radius], [0.0], [0.0]])
     launch_site = ax.scatter([], [], [], s=55, color="#f39c12", label="Launch site")
 
-    # Satellite artists.
-    sat_lines = {}
-    sat_points = {}
-    sat_classes = {}
-    sat_last_steps = {}
-
-    for sat_id in sat_ids:
-        sat_class = int(tracks[sat_id]["class"].iloc[0])
-        sat_classes[sat_id] = sat_class
-        sat_last_steps[sat_id] = int(tracks[sat_id]["step"].iloc[-1])
-
-        color = CLASS_COLORS.get(sat_class, "gray")
-        (line,) = ax.plot([], [], [], color=color, linewidth=1.4, alpha=0.9)
-        (point,) = ax.plot([], [], [], marker="o", color=color, markersize=5)
-        sat_lines[sat_id] = line
-        sat_points[sat_id] = point
+    # Scalable artists for all satellites: one current-point and one trail cloud per class.
+    current_points = {
+        cls: ax.scatter([], [], [], s=[], color=CLASS_COLORS[cls], alpha=0.95)
+        for cls in [1, 2, 3]
+    }
+    trail_points = {
+        cls: ax.scatter([], [], [], s=3, color=CLASS_COLORS[cls], alpha=0.20)
+        for cls in [1, 2, 3]
+    }
 
     max_radius_km = 0.0
     for sat_id in sat_ids:
-        xyz = transformed[sat_id] / 1000.0
+        xyz = transformed_km[sat_id]
         max_radius_km = max(max_radius_km, float(np.max(np.sqrt(np.sum(xyz * xyz, axis=0)))))
 
-    lim = max(max_radius_km * 1.05, meridian_radius * 1.8)
+    # Use percentile-based zoom so a few far-escape satellites do not shrink the scene.
+    all_radii = np.concatenate([
+        np.sqrt(np.sum(transformed_km[sat_id] * transformed_km[sat_id], axis=0)) for sat_id in sat_ids
+    ])
+    zoom_radius_km = float(np.percentile(all_radii, 97.0))
+    lim = max(zoom_radius_km * 1.08, meridian_radius * 1.35)
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_zlim(-lim, lim)
@@ -179,13 +234,36 @@ def main() -> Optional[FuncAnimation]:
     legend_handles.append(plt.Line2D([0], [0], marker="o", color="#f39c12", lw=0, label="Launch site"))
     ax.legend(handles=legend_handles, loc="upper left")
 
-    info_text = ax.text2D(0.01, 0.97, "", transform=ax.transAxes)
+    info_text = ax.text2D(0.01, 0.98, "", transform=ax.transAxes)
+    encoding_text = ax.text2D(
+        0.01,
+        0.02,
+        "Marker size encodes mass (kg). Colors encode class. Trails show recent motion.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
+
+    masses = np.array([sat_meta[sat_id]["mass_kg"] for sat_id in sat_ids], dtype=float)
+    mass_min = float(np.min(masses))
+    mass_max = float(np.max(masses))
+
+    def size_from_mass(mass_kg: float) -> float:
+        if mass_max <= mass_min:
+            return 6.0
+        frac = (mass_kg - mass_min) / (mass_max - mass_min)
+        return 3.0 + 8.0 * frac
+
+    sat_sizes = {sat_id: size_from_mass(sat_meta[sat_id]["mass_kg"]) for sat_id in sat_ids}
 
     # Speed up long tracks for smoother preview.
-    stride = 10 if max_step > 1600 else 5 if max_step > 800 else 2
+    stride = 40 if max_step > 3000 else 20 if max_step > 1200 else 10
+    if not fast_mode:
+        stride = max(5, stride // 2)
     frame_steps = list(range(0, max_step + 1, stride))
     if frame_steps[-1] != max_step:
         frame_steps.append(max_step)
+
+    trail_points_per_sat = 2 if fast_mode else 8
 
     def update(frame_idx: int):
         step_now = frame_steps[frame_idx]
@@ -201,55 +279,81 @@ def main() -> Optional[FuncAnimation]:
         site = rz @ launch_site_base
         launch_site._offsets3d = ([site[0, 0]], [site[1, 0]], [site[2, 0]])
 
-        visible_stable = 0
-        visible_escape = 0
-        visible_crash = 0
+        visible = {1: 0, 2: 0, 3: 0}
+        speed_sum = {1: 0.0, 2: 0.0, 3: 0.0}
+
+        current_xyz = {1: [[], [], []], 2: [[], [], []], 3: [[], [], []]}
+        current_sizes = {1: [], 2: [], 3: []}
+        trail_xyz = {1: [[], [], []], 2: [[], [], []], 3: [[], [], []]}
 
         for sat_id in sat_ids:
-            sat_class = sat_classes[sat_id]
-            last_step = sat_last_steps[sat_id]
+            sat_class = int(sat_meta[sat_id]["class"])
+            steps = step_arrays[sat_id]
+            step_stride = step_stride_map[sat_id]
 
-            # Escape/crash satellites disappear after they fall out or re-enter.
-            if sat_class in (2, 3) and step_now > last_step:
-                sat_lines[sat_id].set_data([], [])
-                sat_lines[sat_id].set_3d_properties([])
-                sat_points[sat_id].set_data([], [])
-                sat_points[sat_id].set_3d_properties([])
-                continue
-
-            steps = tracks[sat_id]["step"].to_numpy()
-            upto = np.searchsorted(steps, step_now, side="right")
+            # Steps are uniformly sampled in trajectory CSV, so direct indexing is faster than searchsorted.
+            upto = min(len(steps), int(step_now // step_stride) + 1)
             if upto <= 0:
-                sat_lines[sat_id].set_data([], [])
-                sat_lines[sat_id].set_3d_properties([])
-                sat_points[sat_id].set_data([], [])
-                sat_points[sat_id].set_3d_properties([])
                 continue
 
-            xyz = transformed[sat_id][:, :upto] / 1000.0
-            sat_lines[sat_id].set_data(xyz[0], xyz[1])
-            sat_lines[sat_id].set_3d_properties(xyz[2])
+            xyz = transformed_km[sat_id]
+            x_now = float(xyz[0, upto - 1])
+            y_now = float(xyz[1, upto - 1])
+            z_now = float(xyz[2, upto - 1])
 
-            sat_points[sat_id].set_data([xyz[0, -1]], [xyz[1, -1]])
-            sat_points[sat_id].set_3d_properties([xyz[2, -1]])
+            current_xyz[sat_class][0].append(x_now)
+            current_xyz[sat_class][1].append(y_now)
+            current_xyz[sat_class][2].append(z_now)
+            current_sizes[sat_class].append(sat_sizes[sat_id])
 
-            if sat_class == 1:
-                visible_stable += 1
-            elif sat_class == 2:
-                visible_escape += 1
-            elif sat_class == 3:
-                visible_crash += 1
+            speed_now = float(speed_arrays[sat_id][upto - 1])
+            if not np.isnan(speed_now):
+                speed_sum[sat_class] += speed_now
+            visible[sat_class] += 1
 
+            trail_start = max(0, upto - trail_points_per_sat)
+            trail_slice = xyz[:, trail_start:upto]
+            trail_xyz[sat_class][0].extend(trail_slice[0])
+            trail_xyz[sat_class][1].extend(trail_slice[1])
+            trail_xyz[sat_class][2].extend(trail_slice[2])
+
+        for cls in [1, 2, 3]:
+            current_points[cls]._offsets3d = (
+                current_xyz[cls][0],
+                current_xyz[cls][1],
+                current_xyz[cls][2],
+            )
+            current_points[cls].set_sizes(np.asarray(current_sizes[cls], dtype=float))
+            trail_points[cls]._offsets3d = (
+                trail_xyz[cls][0],
+                trail_xyz[cls][1],
+                trail_xyz[cls][2],
+            )
+
+        stable_avg = speed_sum[1] / max(1, visible[1])
+        escape_avg = speed_sum[2] / max(1, visible[2])
+        crash_avg = speed_sum[3] / max(1, visible[3])
         info_text.set_text(
-            f"Step: {step_now}    Visible -> Stable: {visible_stable}, Escape: {visible_escape}, Crash: {visible_crash}"
+            f"Step: {step_now}  |  Visible: {sum(visible.values())}/{len(sat_ids)}  "
+            f"(Stable {visible[1]}, Escape {visible[2]}, Crash {visible[3]})\n"
+            f"Avg speed (m/s): Stable {stable_avg:.1f}, Escape {escape_avg:.1f}, Crash {crash_avg:.1f}  |  "
+            f"Mass range: {mass_min:.1f}-{mass_max:.1f} kg"
         )
 
-        artists = [meridian_line, launch_site, info_text]
-        artists.extend(sat_lines.values())
-        artists.extend(sat_points.values())
+        artists = [meridian_line, launch_site, info_text, encoding_text]
+        artists.extend(current_points.values())
+        artists.extend(trail_points.values())
         return artists
 
-    anim = FuncAnimation(fig, update, frames=len(frame_steps), interval=40, blit=False, repeat=True)
+    anim_interval_ms = 80 if fast_mode else 40
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(frame_steps),
+        interval=anim_interval_ms,
+        blit=False,
+        repeat=True,
+    )
     ANIMATION_REF = anim
 
     plt.tight_layout()
