@@ -33,7 +33,7 @@
 /* Simulation parameters */
 #define NUM_SATS    6000             /* Total satellites to simulate            */
 #define DT          1.0             /* Time step in seconds                    */
-#define NUM_STEPS   5400            /* Steps = 90 min (1 typical LEO period)   */
+#define NUM_STEPS   5400            /* Steps = 90 min (1 typical GEO period)   */
 #define THREADS_PER_BLOCK 256       /* Standard CUDA block size                */
 #define TRACE_SATS  12              /* Number of representative trajectories    */
 
@@ -47,6 +47,9 @@
 #define ALT_MAX     2.0e6           /* Max altitude above surface = 2000 km    */
 #define VEL_MIN     5000.0          /* Min initial speed (m/s)                 */
 #define VEL_MAX     12000.0         /* Max initial speed (m/s)                 */
+#define MASS_MIN    80.0            /* Min satellite mass (kg)                 */
+#define MASS_MAX    1200.0          /* Max satellite mass (kg)                 */
+#define TRAJ_OUTPUT_STRIDE 5        /* Write every Nth step in trajectory CSV  */
 /*
  * NOTE: Circular orbit velocity at altitude h is:
  *         v_circ = sqrt(GM / (R_EARTH + h))
@@ -329,6 +332,7 @@ void cpu_euler_simulate(
 void generate_initial_conditions(
     double *x0, double *y0,
     double *vx0, double *vy0,
+    double *mass0,
     int n
 ) {
     /* Grid dimensions */
@@ -351,6 +355,7 @@ void generate_initial_conditions(
         y0[i]  = 0.0;
         vx0[i] = 0.0;
         vy0[i] = speed;
+        mass0[i] = MASS_MIN + (i / (double)(n - 1)) * (MASS_MAX - MASS_MIN);
     }
 }
 
@@ -372,6 +377,7 @@ void write_results_csv(
     const char *filename,
     const double *x0, const double *y0,
     const double *vx0, const double *vy0,
+    const double *mass0,
     const double *euler_final_x,
     const double *euler_final_y,
     const int *euler_cls, const double *euler_energy,
@@ -383,14 +389,14 @@ void write_results_csv(
     FILE *f = fopen(filename, "w");
     if (!f) { fprintf(stderr, "Cannot open %s\n", filename); return; }
 
-    fprintf(f, "sat_id,x0_m,y0_m,vx0_ms,vy0_ms,"
+    fprintf(f, "sat_id,mass_kg,x0_m,y0_m,vx0_ms,vy0_ms,"
                "euler_class,euler_energy,euler_final_x_m,euler_final_y_m,"
                "rk4_class,rk4_energy,rk4_final_x_m,rk4_final_y_m\n");
 
     for (int i = 0; i < n; i++) {
-        fprintf(f, "%d,%.3f,%.3f,%.3f,%.3f,%d,%.6e,%.3f,%.3f,%d,%.6e,%.3f,%.3f\n",
+        fprintf(f, "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%.6e,%.3f,%.3f,%d,%.6e,%.3f,%.3f\n",
                 i,
-                x0[i], y0[i], vx0[i], vy0[i],
+                mass0[i], x0[i], y0[i], vx0[i], vy0[i],
                 euler_cls[i], euler_energy[i], euler_final_x[i], euler_final_y[i],
                 rk4_cls[i],   rk4_energy[i],   rk4_final_x[i],   rk4_final_y[i]);
     }
@@ -398,62 +404,33 @@ void write_results_csv(
     printf("Results written to: %s\n", filename);
 }
 
-void write_sample_trajectories_csv(
+void write_all_trajectories_csv(
     const char *filename,
     const double *x0, const double *y0,
     const double *vx0, const double *vy0,
+    const double *mass0,
     const int *rk4_cls,
     int n
 ) {
-    int sample_ids[TRACE_SATS];
-    int sample_count = 0;
-
-    int per_class_target = TRACE_SATS / 3;
-    int stable_taken = 0, escape_taken = 0, crash_taken = 0;
-
-    for (int i = 0; i < n && sample_count < TRACE_SATS; i++) {
-        if (rk4_cls[i] == ORBIT_STABLE && stable_taken < per_class_target) {
-            sample_ids[sample_count++] = i;
-            stable_taken++;
-        } else if (rk4_cls[i] == ORBIT_ESCAPE && escape_taken < per_class_target) {
-            sample_ids[sample_count++] = i;
-            escape_taken++;
-        } else if (rk4_cls[i] == ORBIT_CRASH && crash_taken < per_class_target) {
-            sample_ids[sample_count++] = i;
-            crash_taken++;
-        }
-    }
-
-    for (int i = 0; i < n && sample_count < TRACE_SATS; i++) {
-        int already_selected = 0;
-        for (int j = 0; j < sample_count; j++) {
-            if (sample_ids[j] == i) {
-                already_selected = 1;
-                break;
-            }
-        }
-        if (!already_selected) {
-            sample_ids[sample_count++] = i;
-        }
-    }
-
     FILE *f = fopen(filename, "w");
     if (!f) {
         fprintf(stderr, "Cannot open %s\n", filename);
         return;
     }
 
-    fprintf(f, "step,sat_id,class,x_m,y_m,r_km\n");
+    fprintf(f, "step,sat_id,class,mass_kg,vx_ms,vy_ms,speed_ms,x_m,y_m,r_km\n");
 
-    for (int s = 0; s < sample_count; s++) {
-        int id = sample_ids[s];
+    for (int id = 0; id < n; id++) {
         double x = x0[id], y = y0[id];
         double vx = vx0[id], vy = vy0[id];
 
         for (int step = 0; step <= NUM_STEPS; step++) {
-            double r_km = sqrt(x*x + y*y) / 1000.0;
-            fprintf(f, "%d,%d,%d,%.3f,%.3f,%.3f\n",
-                    step, id, rk4_cls[id], x, y, r_km);
+            if (step % TRAJ_OUTPUT_STRIDE == 0 || step == NUM_STEPS) {
+                double speed_ms = sqrt(vx*vx + vy*vy);
+                double r_km = sqrt(x*x + y*y) / 1000.0;
+                fprintf(f, "%d,%d,%d,%.3f,%.6f,%.6f,%.6f,%.3f,%.3f,%.3f\n",
+                        step, id, rk4_cls[id], mass0[id], vx, vy, speed_ms, x, y, r_km);
+            }
 
             if (step == NUM_STEPS) {
                 break;
@@ -503,7 +480,8 @@ void write_sample_trajectories_csv(
     }
 
     fclose(f);
-    printf("Trajectory samples written to: %s (%d satellites)\n", filename, sample_count);
+    printf("Trajectory data written to: %s (%d satellites, stride=%d)\n",
+           filename, n, TRAJ_OUTPUT_STRIDE);
 }
 
 
@@ -537,6 +515,7 @@ int main(void) {
     double *h_y0     = (double*)malloc(sz_d);
     double *h_vx0    = (double*)malloc(sz_d);
     double *h_vy0    = (double*)malloc(sz_d);
+    double *h_mass0  = (double*)malloc(sz_d);
 
     /* Euler output */
     int    *h_euler_cls    = (int*)malloc(sz_i);
@@ -557,7 +536,7 @@ int main(void) {
     double *h_rk4_final_y   = (double*)malloc(sz_d);
 
     /* ══ STEP B: Generate initial conditions ══ */
-    generate_initial_conditions(h_x0, h_y0, h_vx0, h_vy0, NUM_SATS);
+    generate_initial_conditions(h_x0, h_y0, h_vx0, h_vy0, h_mass0, NUM_SATS);
     printf("Initial conditions generated for %d satellites.\n", NUM_SATS);
 
     /* ══ STEP C: CPU baseline timing ══ */
@@ -676,14 +655,15 @@ int main(void) {
     /* ══ STEP H: Write CSV ══ */
     write_results_csv("orbit_results.csv",
                       h_x0, h_y0, h_vx0, h_vy0,
+                      h_mass0,
                       h_euler_final_x, h_euler_final_y,
                       h_euler_cls, h_euler_energy,
                       h_rk4_final_x, h_rk4_final_y,
                       h_rk4_cls,   h_rk4_energy,
                       NUM_SATS);
 
-    write_sample_trajectories_csv("trajectory_samples.csv",
-                                  h_x0, h_y0, h_vx0, h_vy0,
+    write_all_trajectories_csv("trajectory_samples.csv",
+                                  h_x0, h_y0, h_vx0, h_vy0, h_mass0,
                                   h_rk4_cls, NUM_SATS);
 
     /* ══ STEP I: Save timing for plot ══ */
@@ -700,7 +680,7 @@ int main(void) {
     cudaFree(d_x0); cudaFree(d_y0); cudaFree(d_vx0); cudaFree(d_vy0);
     cudaFree(d_cls); cudaFree(d_final_x); cudaFree(d_final_y); cudaFree(d_energy);
 
-    free(h_x0); free(h_y0); free(h_vx0); free(h_vy0);
+    free(h_x0); free(h_y0); free(h_vx0); free(h_vy0); free(h_mass0);
     free(h_euler_cls); free(h_euler_energy);
     free(h_rk4_cls);   free(h_rk4_energy);
     free(h_cpu_cls);   free(h_cpu_energy);

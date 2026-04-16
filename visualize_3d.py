@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 R_EARTH = 6.371e6  # m
-VISUAL_EARTH_SCALE = 10.0  # Display-only scale to make Earth easier to see.
+VISUAL_EARTH_SCALE = 1000000.0  # Display-only scale to make Earth easier to see.
 FORCE_COMMON_LAUNCH = True  # Visualization-only: all tracks start from one launch point.
 COMMON_LAUNCH_RADIUS_M = R_EARTH
 
@@ -35,6 +35,8 @@ CLASS_LABELS = {
 
 # Global reference for notebook environments so animation is not garbage-collected.
 ANIMATION_REF = None
+MAX_SATELLITES = 1000
+RANDOM_SEED = 42
 
 
 def is_notebook() -> bool:
@@ -106,6 +108,11 @@ def load_trajectories(
     if df.empty:
         raise RuntimeError("trajectory_samples.csv is empty")
 
+    unique_sat_ids = df["sat_id"].drop_duplicates()
+    if len(unique_sat_ids) > MAX_SATELLITES:
+        sampled_ids = unique_sat_ids.sample(n=MAX_SATELLITES, random_state=RANDOM_SEED)
+        df = df[df["sat_id"].isin(sampled_ids)].copy()
+
     if "mass_kg" not in df.columns:
         df["mass_kg"] = 500.0
 
@@ -153,7 +160,7 @@ def main() -> Optional[FuncAnimation]:
     tracks, transformed, step_arrays, speed_arrays, sat_meta, max_step = load_trajectories(csv_path)
     sat_ids = sorted(tracks.keys())
 
-    # Performance profile: "fast" is tuned for 6000-satellite desktop playback.
+    # Performance profile: "fast" targets large satellite sets (up to 1000 sampled tracks here).
     render_profile = os.environ.get("VIS3D_PROFILE", "fast").strip().lower()
     fast_mode = render_profile != "quality"
 
@@ -170,7 +177,7 @@ def main() -> Optional[FuncAnimation]:
         else:
             step_stride_map[sat_id] = 1
 
-    fig = plt.figure(figsize=(12, 9))
+    fig = plt.figure(figsize=(13, 9.5))
     ax = fig.add_subplot(111, projection="3d")
 
     # Draw Earth sphere.
@@ -225,21 +232,22 @@ def main() -> Optional[FuncAnimation]:
     ax.set_xlabel("X (km)")
     ax.set_ylabel("Y (km)")
     ax.set_zlabel("Z (km)")
-    ax.set_title("3D Orbit Animation: Rotating Earth and Satellite Outcomes")
+    ax.set_title("3D Orbit Animation: Rotating Earth and Satellite Outcomes", pad=10)
 
     legend_handles = []
     for cls in [1, 2, 3]:
         handle = plt.Line2D([0], [0], color=CLASS_COLORS[cls], lw=2, label=CLASS_LABELS[cls])
         legend_handles.append(handle)
     legend_handles.append(plt.Line2D([0], [0], marker="o", color="#f39c12", lw=0, label="Launch site"))
-    ax.legend(handles=legend_handles, loc="upper left")
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.0, 1.02), borderaxespad=0.0)
 
-    info_text = ax.text2D(0.01, 0.98, "", transform=ax.transAxes)
-    encoding_text = ax.text2D(
-        0.01,
-        0.02,
+    info_text = fig.text(0.32, 0.86, "", ha="left", va="top")
+    encoding_text = fig.text(
+        0.5,
+        0.03,
         "Marker size encodes mass (kg). Colors encode class. Trails show recent motion.",
-        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
         fontsize=9,
     )
 
@@ -356,7 +364,8 @@ def main() -> Optional[FuncAnimation]:
     )
     ANIMATION_REF = anim
 
-    plt.tight_layout()
+    # Leave larger whitespace bands so labels and status text stay away from the 3D axes.
+    fig.subplots_adjust(left=0.06, right=0.97, bottom=0.12, top=0.74)
 
     # In notebooks/Colab, explicitly render inline to avoid "Animation was deleted" warnings.
     if is_notebook():
